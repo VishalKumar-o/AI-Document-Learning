@@ -1,4 +1,7 @@
 fastapi==0.159.1
-pymupdf==2.0
-python-multipart==0.0.32
 uvicorn==0.54.0
+python-multipart==0.0.32
+pymupdf==2.0
+sentence-transformers==6.2.0
+faiss-cpu==1.15.1
+numpy==2.5.4

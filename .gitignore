@@ -20,3 +20,10 @@ frontend/dist/
 .vscode/
 .idea/
 .DS_Store
+
+# Local backups
+*.backup
+*.before-*
+
+# Generated retrieval index and chunks
+backend/data/
