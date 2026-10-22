@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Uploaded PDFs and user data
+backend/uploads/
+uploads/
+
+# React and Node.js
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# IDE files
+.vscode/
+.idea/
+.DS_Store
