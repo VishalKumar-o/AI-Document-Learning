@@ -1,4 +1,4 @@
-# AI-Based Document Learning and Question Answering System
+# AI-Based Document Learning and Question Answering System Using RAG (Retrieval-Augmented Generation)
 
 An AI-powered document learning application that retrieves relevant information from uploaded PDF documents and uses a local language model to answer questions.
 
