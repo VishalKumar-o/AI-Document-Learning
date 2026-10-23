@@ -1,8 +1,11 @@
-
 import json
+import os
 import socket
 import urllib.error
 import urllib.request
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 import fitz
@@ -10,6 +13,13 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from database import (
+    delete_document as delete_document_record,
+    get_all_documents,
+    get_document as get_document_record,
+    initialize_database,
+    save_document,
+)
 from retrieval_service import document_search
 
 
@@ -24,13 +34,97 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 OLLAMA_TIMEOUT = 300
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Active documents and search indexes are held in memory.
+# SQLite permanently stores document metadata.
+documents = {}
+
+
+# --------------------------------------------------
+# STARTUP: RESTORE SAVED DOCUMENTS AND SEARCH INDEXES
+# --------------------------------------------------
+
+def extract_pdf_chunks(file_path):
+    """Extract text chunks and page count from a saved PDF."""
+
+    all_chunks = []
+
+    with fitz.open(file_path) as pdf:
+        page_count = len(pdf)
+
+        for page_number, page in enumerate(pdf, start=1):
+            text = page.get_text("text")
+            all_chunks.extend(
+                split_into_chunks(text, page_number)
+            )
+
+    return page_count, all_chunks
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize SQLite and rebuild indexes when FastAPI starts."""
+
+    initialize_database()
+    documents.clear()
+
+    for record in get_all_documents():
+        document_id = record["document_id"]
+        file_path = record["file_path"]
+
+        if not os.path.isfile(file_path):
+            print(
+                f"WARNING: PDF missing for {record['filename']}. "
+                "Skipping index restoration."
+            )
+            continue
+
+        try:
+            page_count, all_chunks = extract_pdf_chunks(file_path)
+
+            if not all_chunks:
+                print(
+                    f"WARNING: No readable text in "
+                    f"{record['filename']}. Skipping."
+                )
+                continue
+
+            document_search.add_document(document_id, all_chunks)
+
+            # Refresh metadata if the saved PDF has changed.
+            record["pages"] = page_count
+            record["chunks"] = len(all_chunks)
+
+            documents[document_id] = record
+
+            print(
+                f"Restored: {record['filename']} "
+                f"({page_count} pages, {len(all_chunks)} chunks)"
+            )
+
+        except Exception as error:
+            # One damaged PDF should not prevent the API from starting.
+            print(
+                f"WARNING: Could not restore "
+                f"{record['filename']}: {error}"
+            )
+
+    print(f"SQLite initialized. Restored {len(documents)} document(s).")
+
+    yield
+
+
 app = FastAPI(
     title="AI Document Learning and Question Answering System",
     description=(
-        "Upload a PDF, search its content, and ask questions "
-        "with answers grounded in document passages."
+        "Upload multiple PDFs, manage documents, search their content, "
+        "and ask questions with page-based sources."
     ),
-    version="1.1.0"
+    version="1.3.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -50,13 +144,62 @@ class AskRequest(BaseModel):
     question: str = Field(
         ...,
         min_length=1,
-        description="Question about the uploaded document."
+        description="Question about an uploaded document.",
     )
     top_k: Optional[int] = Field(
         default=5,
         ge=1,
         le=10,
-        description="Number of document passages to retrieve."
+        description="Number of document passages to retrieve.",
+    )
+    document_id: Optional[str] = Field(
+        default=None,
+        description="ID of the document to search.",
+    )
+
+
+# --------------------------------------------------
+# DOCUMENT HELPERS
+# --------------------------------------------------
+
+def public_document(document):
+    """Return document metadata without its internal file path."""
+
+    return {
+        "document_id": document["document_id"],
+        "filename": document["filename"],
+        "pages": document["pages"],
+        "chunks": document["chunks"],
+        "uploaded_at": document["uploaded_at"],
+    }
+
+
+def resolve_document_id(document_id):
+    """Validate the selected document or choose the only available one."""
+
+    if not documents:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a PDF before continuing.",
+        )
+
+    if document_id:
+        if document_id not in documents:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found. Refresh the document list.",
+            )
+        return document_id
+
+    if len(documents) == 1:
+        return next(iter(documents))
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Please provide document_id to select which PDF to use. "
+            "Get available IDs from GET /documents."
+        ),
     )
 
 
@@ -84,7 +227,7 @@ def split_into_chunks(text, page_number):
             chunks.append({
                 "page": page_number,
                 "chunk_index": chunk_index,
-                "text": chunk_text
+                "text": chunk_text,
             })
             chunk_index += 1
 
@@ -101,10 +244,7 @@ def split_into_chunks(text, page_number):
 # --------------------------------------------------
 
 def build_document_context(results):
-    """
-    Format retrieved passages so the model can identify
-    which page supports each part of its answer.
-    """
+    """Format retrieved passages with page citations."""
 
     context_parts = []
 
@@ -112,12 +252,10 @@ def build_document_context(results):
         page = result.get("page", "Unknown")
         text = result.get("text", "").strip()
 
-        if not text:
-            continue
-
-        context_parts.append(
-            f"[Source {index} | Page {page}]\n{text}"
-        )
+        if text:
+            context_parts.append(
+                f"[Source {index} | Page {page}]\n{text}"
+            )
 
     return "\n\n".join(context_parts)
 
@@ -127,18 +265,12 @@ def build_document_context(results):
 # --------------------------------------------------
 
 def generate_local_answer(question, context):
-    """
-    Generate an answer using the local Ollama model.
-
-    The model must answer the exact question, use document
-    evidence, distinguish events, and cite supporting pages.
-    """
+    """Generate a grounded answer using the local Ollama model."""
 
     prompt = f"""
 You are an accurate document question-answering assistant.
 
-Your task is to answer the user's exact question using ONLY
-the supplied document passages.
+Answer the user's exact question using ONLY the supplied document passages.
 
 DOCUMENT PASSAGES:
 {context}
@@ -146,74 +278,24 @@ DOCUMENT PASSAGES:
 USER QUESTION:
 {question}
 
-FOLLOW THESE RULES CAREFULLY:
-
-1. Answer the exact question asked. Do not answer a different
-   or broader question.
-
-2. Find the specific fact requested before writing the answer.
-   For example, if the user asks where someone LANDED after
-   falling, state the exact place where they landed.
-
+RULES:
+1. Answer the exact question asked.
+2. Identify the specific fact requested before answering.
 3. Do not confuse events that happen one after another.
-   If a character first lands in one place and later enters
-   another place, keep these events separate.
+4. Prioritize passages that directly describe the requested event.
+5. Explain events in chronological order when needed.
+6. Use only facts supported by the passages.
+7. Combine passages only when they help answer the question.
+8. Cite supporting pages using (Page 4) or (Pages 3 and 4).
+9. Every cited page must support the statement next to it.
+10. Ignore irrelevant passages.
+11. Do not invent quotations or facts.
+12. Use simple English, usually one to three sentences.
+13. If the passages do not contain enough evidence, respond with exactly:
+I could not find enough information to answer this question
+in the uploaded document.
 
-4. When the question asks about a specific event, prioritize
-   the passage that directly describes that event.
-
-5. If the passages describe several events, explain them in
-   chronological order when needed to answer the question.
-
-6. Use only facts supported by the supplied passages.
-   Do not invent details, reasons, motives, or conclusions.
-
-7. If multiple passages provide relevant evidence, combine
-   them only when they help answer the actual question.
-
-8. Cite the page that supports each factual statement.
-   Use the format (Page 4) or (Pages 3 and 4).
-
-9. Do not cite a page just because it appears in the context.
-   Each cited page must support the statement next to it.
-
-10. Ignore irrelevant passages, even if they mention the same
-    character or topic.
-
-11. Do not invent quotations. Only quote words that appear
-    exactly in the supplied passages.
-
-12. Use simple, clear English. Usually answer in one to three
-    sentences. Include important details without unnecessary
-    explanations.
-
-13. If the passages do not contain enough evidence to answer,
-    respond with exactly:
-    I could not find enough information to answer this question
-    in the uploaded document.
-
-EXAMPLE OF PRECISE ANSWERING:
-
-Question:
-Where did Alice land after falling down the rabbit hole?
-
-Document passage:
-[Source 1 | Page 4]
-"Down she came upon a heap of sticks and dry leaves,
-and the fall was over."
-Later in the same passage, Alice finds herself in a long,
-low hall lit by lamps.
-
-Incorrect answer:
-Alice landed in a dark hall (Page 4).
-
-Correct answer:
-Alice landed on a heap of sticks and dry leaves (Page 4).
-
-The hall was where she arrived later, not where she first landed.
-
-Now answer the user's actual question using the supplied
-document passages. Follow the same level of precision.
+Now answer the user's actual question using the supplied passages.
 """
 
     payload = {
@@ -227,38 +309,37 @@ document passages. Follow the same level of precision.
                     "Answer the exact question, distinguish events "
                     "correctly, and provide accurate page citations. "
                     "Never guess or invent facts."
-                )
+                ),
             },
             {
                 "role": "user",
-                "content": prompt
-            }
+                "content": prompt,
+            },
         ],
         "stream": False,
         "options": {
-            "temperature": 0.1
-        }
+            "temperature": 0.1,
+        },
     }
 
     request = urllib.request.Request(
         OLLAMA_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
-        method="POST"
+        method="POST",
     )
 
     try:
         with urllib.request.urlopen(
             request,
-            timeout=OLLAMA_TIMEOUT
+            timeout=OLLAMA_TIMEOUT,
         ) as response:
             response_data = json.loads(
                 response.read().decode("utf-8")
             )
 
         answer = (
-            response_data
-            .get("message", {})
+            response_data.get("message", {})
             .get("content", "")
             .strip()
         )
@@ -266,7 +347,7 @@ document passages. Follow the same level of precision.
         if not answer:
             raise HTTPException(
                 status_code=502,
-                detail="Ollama returned an empty answer."
+                detail="Ollama returned an empty answer.",
             )
 
         return answer
@@ -277,15 +358,11 @@ document passages. Follow the same level of precision.
     except urllib.error.HTTPError as error:
         error_body = error.read().decode(
             "utf-8",
-            errors="replace"
+            errors="replace",
         )
-
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Ollama returned HTTP {error.code}: "
-                f"{error_body}"
-            )
+            detail=f"Ollama returned HTTP {error.code}: {error_body}",
         )
 
     except urllib.error.URLError as error:
@@ -294,39 +371,33 @@ document passages. Follow the same level of precision.
         if isinstance(reason, (socket.timeout, TimeoutError)):
             raise HTTPException(
                 status_code=504,
-                detail=(
-                    "Ollama timed out. Try again or use a shorter "
-                    "question."
-                )
+                detail="Ollama timed out. Please try again.",
             )
 
         raise HTTPException(
             status_code=503,
             detail=(
-                "Cannot connect to Ollama. Check that Ollama is "
-                f"running. Details: {reason}"
-            )
+                "Cannot connect to Ollama. Check that it is running. "
+                f"Details: {reason}"
+            ),
         )
 
     except (socket.timeout, TimeoutError):
         raise HTTPException(
             status_code=504,
-            detail=(
-                "The local model took too long to respond. "
-                "Try again or use a shorter question."
-            )
+            detail="The local model took too long to respond.",
         )
 
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=502,
-            detail="Ollama returned an invalid JSON response."
+            detail="Ollama returned an invalid JSON response.",
         )
 
     except OSError as error:
         raise HTTPException(
             status_code=502,
-            detail=f"Could not read the Ollama response: {error}"
+            detail=f"Could not read the Ollama response: {error}",
         )
 
 
@@ -339,7 +410,7 @@ def home():
     return {
         "message": "AI Document Learning and Question Answering System",
         "model": OLLAMA_MODEL,
-        "status": "running"
+        "status": "running",
     }
 
 
@@ -352,7 +423,8 @@ def health():
     return {
         "status": "ok",
         "model": OLLAMA_MODEL,
-        "indexed_chunks": len(document_search.chunks)
+        "document_count": len(documents),
+        "indexed_chunks": len(document_search.chunks),
     }
 
 
@@ -362,15 +434,14 @@ def health():
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Extract text from a PDF and index its chunks."""
+    """Upload, extract, index, and permanently register a PDF."""
 
-    if (
-        not file.filename
-        or not file.filename.lower().endswith(".pdf")
-    ):
+    filename = os.path.basename(file.filename or "")
+
+    if not filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
-            detail="Please upload a PDF file."
+            detail="Please upload a PDF file.",
         )
 
     content = await file.read()
@@ -378,32 +449,26 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file is empty."
+            detail="The uploaded file is empty.",
         )
 
     try:
-        all_chunks = []
-
-        with fitz.open(
-            stream=content,
-            filetype="pdf"
-        ) as pdf:
+        with fitz.open(stream=content, filetype="pdf") as pdf:
             page_count = len(pdf)
+            all_chunks = []
 
             for page_number, page in enumerate(pdf, start=1):
-                page_text = page.get_text("text")
-
-                page_chunks = split_into_chunks(
-                    page_text,
-                    page_number
+                all_chunks.extend(
+                    split_into_chunks(
+                        page.get_text("text"),
+                        page_number,
+                    )
                 )
-
-                all_chunks.extend(page_chunks)
 
     except Exception as error:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not read the PDF: {str(error)}"
+            detail=f"Could not read the PDF: {error}",
         )
 
     if not all_chunks:
@@ -412,24 +477,146 @@ async def upload_pdf(file: UploadFile = File(...)):
             detail=(
                 "No readable text was found in this PDF. "
                 "It may be a scanned PDF that needs OCR."
-            )
+            ),
         )
 
+    document_id = uuid.uuid4().hex
+    file_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
+
+    document = {
+        "document_id": document_id,
+        "filename": filename,
+        "pages": page_count,
+        "chunks": len(all_chunks),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "file_path": file_path,
+    }
+
+    index_added = False
+    file_saved = False
+    database_saved = False
+
     try:
-        document_search.add_chunks(all_chunks)
+        with open(file_path, "wb") as saved_file:
+            saved_file.write(content)
+        file_saved = True
+
+        document_search.add_document(document_id, all_chunks)
+        index_added = True
+
+        save_document(document)
+        database_saved = True
+
+        documents[document_id] = document
 
     except Exception as error:
+        if index_added:
+            document_search.remove_document(document_id)
+
+        if database_saved:
+            delete_document_record(document_id)
+
+        documents.pop(document_id, None)
+
+        if file_saved and os.path.exists(file_path):
+            os.remove(file_path)
+
         raise HTTPException(
             status_code=500,
-            detail=f"Could not index the PDF: {str(error)}"
+            detail=f"Could not register or index the PDF: {error}",
         )
 
     return {
         "message": "PDF uploaded and indexed successfully.",
-        "filename": file.filename,
-        "pages": page_count,
-        "chunks_added": len(all_chunks),
-        "total_indexed_chunks": len(document_search.chunks)
+        **public_document(document),
+        "total_documents": len(documents),
+        "total_indexed_chunks": len(document_search.chunks),
+    }
+
+
+# --------------------------------------------------
+# LIST ALL DOCUMENTS
+# --------------------------------------------------
+
+@app.get("/documents")
+def list_documents():
+    """List documents registered in the active application."""
+
+    return {
+        "total_documents": len(documents),
+        "documents": [
+            public_document(document)
+            for document in documents.values()
+        ],
+    }
+
+
+# --------------------------------------------------
+# GET ONE DOCUMENT
+# --------------------------------------------------
+
+@app.get("/documents/{document_id}")
+def get_one_document(document_id: str):
+    """Get metadata for one PDF."""
+
+    document = get_document_record(document_id)
+
+    if not document or document_id not in documents:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found or its PDF could not be restored.",
+        )
+
+    return public_document(document)
+
+
+# --------------------------------------------------
+# DELETE ONE DOCUMENT
+# --------------------------------------------------
+
+@app.delete("/documents/{document_id}")
+def delete_one_document(document_id: str):
+    """Delete one PDF, its search index, and its database record."""
+
+    document = documents.get(document_id)
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    file_path = document["file_path"]
+
+    try:
+        # Remove the file first so a file deletion error does not
+        # remove the database record or search index.
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        if not delete_document_record(document_id):
+            raise HTTPException(
+                status_code=500,
+                detail="Could not remove the document database record.",
+            )
+
+        document_search.remove_document(document_id)
+        del documents[document_id]
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not fully delete the document: {error}",
+        )
+
+    return {
+        "message": "Document deleted successfully.",
+        "document_id": document_id,
+        "filename": document["filename"],
+        "remaining_documents": len(documents),
     }
 
 
@@ -438,40 +625,37 @@ async def upload_pdf(file: UploadFile = File(...)):
 # --------------------------------------------------
 
 def answer_document_question(request: AskRequest):
-    """Retrieve relevant passages and generate a grounded answer."""
+    """Search the selected PDF and generate a grounded answer."""
 
     question = request.question.strip()
 
     if not question:
         raise HTTPException(
             status_code=400,
-            detail="Please enter a question."
+            detail="Please enter a question.",
         )
 
-    if not document_search.chunks:
-        raise HTTPException(
-            status_code=400,
-            detail="Upload a PDF before asking a question."
-        )
-
+    document_id = resolve_document_id(request.document_id)
+    document = documents[document_id]
     top_k = max(1, min(request.top_k or 5, 10))
 
     try:
         results = document_search.search(
             question,
-            top_k=top_k
+            top_k=top_k,
+            document_id=document_id,
         )
 
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Document search failed: {str(error)}"
+            detail=f"Document search failed: {error}",
         )
 
     if not results:
         raise HTTPException(
             status_code=404,
-            detail="No relevant information was found in the document."
+            detail="No relevant information was found in this document.",
         )
 
     context = build_document_context(results)
@@ -479,29 +663,28 @@ def answer_document_question(request: AskRequest):
     if not context:
         raise HTTPException(
             status_code=404,
-            detail="The retrieved passages contain no readable text."
+            detail="The retrieved passages contain no readable text.",
         )
 
-    answer = generate_local_answer(
-        question,
-        context
-    )
+    answer = generate_local_answer(question, context)
 
     sources = [
         {
             "page": result["page"],
             "chunk_index": result["chunk_index"],
             "score": round(result["score"], 6),
-            "text": result["text"]
+            "text": result["text"],
         }
         for result in results
     ]
 
     return {
+        "document_id": document_id,
+        "filename": document["filename"],
         "question": question,
         "answer": answer,
         "model": OLLAMA_MODEL,
-        "sources": sources
+        "sources": sources,
     }
 
 
@@ -511,7 +694,6 @@ def answer_document_question(request: AskRequest):
 
 @app.post("/ask")
 def ask_question(request: AskRequest):
-    """Ask a question about the uploaded document."""
     return answer_document_question(request)
 
 
@@ -521,7 +703,6 @@ def ask_question(request: AskRequest):
 
 @app.post("/query")
 def query_question(request: AskRequest):
-    """Alternative endpoint for document question answering."""
     return answer_document_question(request)
 
 
@@ -531,37 +712,36 @@ def query_question(request: AskRequest):
 
 @app.post("/debug-search")
 def debug_search(request: AskRequest):
-    """Return retrieval results without calling the language model."""
+    """Inspect retrieved passages without calling Ollama."""
 
     question = request.question.strip()
 
     if not question:
         raise HTTPException(
             status_code=400,
-            detail="Please enter a question."
+            detail="Please enter a question.",
         )
 
-    if not document_search.chunks:
-        raise HTTPException(
-            status_code=400,
-            detail="Upload a PDF before running document search."
-        )
-
+    document_id = resolve_document_id(request.document_id)
+    document = documents[document_id]
     top_k = max(1, min(request.top_k or 5, 10))
 
     try:
         results = document_search.search(
             question,
-            top_k=top_k
+            top_k=top_k,
+            document_id=document_id,
         )
 
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Document search failed: {str(error)}"
+            detail=f"Document search failed: {error}",
         )
 
     return {
+        "document_id": document_id,
+        "filename": document["filename"],
         "question": question,
-        "results": results
+        "results": results,
     }

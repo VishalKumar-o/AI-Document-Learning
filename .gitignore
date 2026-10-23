@@ -27,3 +27,15 @@ frontend/dist/
 
 # Generated retrieval index and chunks
 backend/data/
+# Local database files
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+
+# Python virtual environments
+backend/.venv/
+backend/venv/
+
+# Local model and cache files
+backend/models/
+backend/cache/
